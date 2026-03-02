@@ -166,7 +166,7 @@ async def _handle_entity_relation_summary(
     description_type: str,
     entity_or_relation_name: str,
     description_list: list[str],
-    seperator: str,
+    separator: str,
     global_config: dict,
     llm_response_cache: BaseKVStorage | None = None,
 ) -> tuple[str, bool]:
@@ -217,12 +217,12 @@ async def _handle_entity_relation_summary(
                 and total_tokens < summary_max_tokens
             ):
                 # no LLM needed, just join the descriptions
-                final_description = seperator.join(current_list)
+                final_description = separator.join(current_list)
                 return final_description if final_description else "", llm_was_used
             else:
                 if total_tokens > summary_context_size and len(current_list) <= 2:
                     logger.warning(
-                        f"Summarizing {entity_or_relation_name}: Oversize descpriton found"
+                        f"Summarizing {entity_or_relation_name}: Oversize description found"
                     )
                 # Final summarization of remaining descriptions - LLM will be used
                 final_summary = await _summarize_descriptions(
@@ -252,7 +252,7 @@ async def _handle_entity_relation_summary(
                     current_chunk.append(desc)
                     chunks.append(current_chunk)
                     logger.warning(
-                        f"Summarizing {entity_or_relation_name}: Oversize descpriton found"
+                        f"Summarizing {entity_or_relation_name}: Oversize description found"
                     )
                     current_chunk = []  # next group is empty
                     current_tokens = 0
@@ -415,6 +415,21 @@ async def _handle_single_entity_extraction(
             )
             return None
 
+        # Handle comma-separated entity types by finding the first non-empty token
+        if "," in entity_type:
+            original = entity_type
+            tokens = [t.strip() for t in entity_type.split(",")]
+            non_empty = [t for t in tokens if t]
+            if not non_empty:
+                logger.warning(
+                    f"Entity extraction error: all tokens empty after comma-split: '{original}'"
+                )
+                return None
+            entity_type = non_empty[0]
+            logger.warning(
+                f"Entity type contains comma, taking first non-empty token: '{original}' -> '{entity_type}'"
+            )
+
         # Remove spaces and convert to lowercase
         entity_type = entity_type.replace(" ", "").lower()
 
@@ -499,6 +514,11 @@ async def _handle_single_relationship_extraction(
 
         # Process relationship description with same cleaning pipeline
         edge_description = sanitize_and_normalize_extracted_text(record_attributes[4])
+        if not edge_description.strip():
+            logger.warning(
+                f"Relationship extraction error: empty description for relation '{source}'~'{target}' in chunk '{chunk_key}'"
+            )
+            return None
 
         edge_source_id = chunk_key
         weight = (
@@ -940,7 +960,7 @@ async def _process_extraction_result(
         ["\n", completion_delimiter, completion_delimiter.lower()],
     )
 
-    # Fix LLM output format error which use tuple_delimiter to seperate record instead of "\n"
+    # Fix LLM output format error which use tuple_delimiter to separate record instead of "\n"
     fixed_records = []
     for record in records:
         record = record.strip()
@@ -973,7 +993,7 @@ async def _process_extraction_result(
 
     if len(fixed_records) != len(records):
         logger.warning(
-            f"{chunk_key}: LLM output format error; find LLM use {tuple_delimiter} as record seperators instead new-line"
+            f"{chunk_key}: LLM output format error; find LLM use {tuple_delimiter} as record separators instead new-line"
         )
 
     for record in fixed_records:
@@ -1610,10 +1630,34 @@ async def _merge_nodes_then_upsert(
     # 1. Get existing node data from knowledge graph
     already_node = await knowledge_graph_inst.get_node(entity_name)
     if already_node:
-        already_entity_types.append(already_node["entity_type"])
-        already_source_ids.extend(already_node["source_id"].split(GRAPH_FIELD_SEP))
-        already_file_paths.extend(already_node["file_path"].split(GRAPH_FIELD_SEP))
-        already_description.extend(already_node["description"].split(GRAPH_FIELD_SEP))
+        existing_entity_type = already_node.get("entity_type")
+        # Coerce to str before any string operations: non-string values from
+        # API/custom graph paths would otherwise raise TypeError on the comma check.
+        if (
+            not isinstance(existing_entity_type, str)
+            or not existing_entity_type.strip()
+        ):
+            existing_entity_type = "UNKNOWN"
+        # Sanitize entity_type read back from DB to prevent dirty data from propagating
+        if "," in existing_entity_type:
+            original = existing_entity_type
+            tokens = [t.strip() for t in existing_entity_type.split(",")]
+            non_empty = [t for t in tokens if t]
+            existing_entity_type = non_empty[0] if non_empty else "UNKNOWN"
+            logger.warning(
+                f"Entity type read from DB contains comma, taking first non-empty token: '{original}' -> '{existing_entity_type}'"
+            )
+        already_entity_types.append(existing_entity_type)
+
+        existing_source_id = already_node.get("source_id") or ""
+        already_source_ids.extend(existing_source_id.split(GRAPH_FIELD_SEP))
+
+        existing_file_path = already_node.get("file_path") or "unknown_source"
+        already_file_paths.extend(existing_file_path.split(GRAPH_FIELD_SEP))
+
+        existing_desc = (already_node.get("description") or "").strip()
+        if existing_desc:
+            already_description.extend(existing_desc.split(GRAPH_FIELD_SEP))
 
     new_source_ids = [dp["source_id"] for dp in nodes_data if dp.get("source_id")]
 
@@ -1720,8 +1764,11 @@ async def _merge_nodes_then_upsert(
     # Combine already_description with sorted new sorted descriptions
     description_list = already_description + sorted_descriptions
     if not description_list:
-        logger.error(f"Entity {entity_name} has no description")
-        raise ValueError(f"Entity {entity_name} has no description")
+        fallback_description = f"Entity {entity_name}"
+        logger.warning(
+            f"Entity `{entity_name}` has no description; fallback to `{fallback_description}`"
+        )
+        description_list = [fallback_description]
 
     # Check for cancellation before LLM summary
     if pipeline_status is not None and pipeline_status_lock is not None:
